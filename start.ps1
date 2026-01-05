@@ -8,7 +8,9 @@
     - Unblocks files
     - Ensures config lives in ProgramData\Config (survives updates)
     - Migrates config from Current -> Config if needed
-    - Ensures an app-only certificate exists in LocalMachine\My (and updates config thumbprint if it generates one)
+    - Populates TenantId + ClientId in config (hardcoded below)
+    - Ensures an app-only certificate exists in LocalMachine\My (CSP provider to avoid CNG key permission issues)
+    - Exports public cert for upload to app registration and updates config thumbprint if it generates one
     - Creates a shortcut on the Public Desktop (works even when elevated)
     - Launches Main.ps1
 
@@ -40,6 +42,10 @@ param(
     [Parameter(Mandatory = $false)]
     [switch]$NoOverwrite
 )
+
+# Hardcode customer tenant + app registration values (as requested)
+[string]$TenantId = "344afb64-754e-45cb-b6c3-8d51d1946615"
+[string]$ClientId = "3769a834-0162-49d2-897f-4b5a255a3ce3"
 
 #region Helpers (no emojis/icons)
 function Write-Info { param([string]$m) Write-Host $m -ForegroundColor Cyan }
@@ -89,6 +95,19 @@ function Test-ZipHeader {
     } catch {
         return $false
     }
+}
+
+function Get-ConfigJson {
+    param([Parameter(Mandatory)][string]$Path)
+    return (Get-Content -Raw -LiteralPath $Path) | ConvertFrom-Json
+}
+
+function Save-ConfigJson {
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)]$Object
+    )
+    ($Object | ConvertTo-Json -Depth 10) | Set-Content -LiteralPath $Path -Encoding UTF8 -Force
 }
 #endregion Helpers
 
@@ -170,7 +189,7 @@ Get-ChildItem -LiteralPath $current -Recurse -File -ErrorAction SilentlyContinue
 }
 #endregion Download + Extract
 
-#region Config (Seed + Migration)
+#region Config (Seed + Migration + Populate Tenant/Client)
 $configPrimary  = Join-Path $config  "customer.config.json"
 $configFallback = Join-Path $current "customer.config.json"
 
@@ -204,11 +223,28 @@ if (-not (Test-Path -LiteralPath $configPrimary)) {
 } else {
     Write-Info "Config present: $configPrimary"
 }
-#endregion Config (Seed + Migration)
 
-#region Remove stale Current config (prevent thumbprint mismatches)
+# Populate TenantId + ClientId (hardcoded above)
+try {
+    $cfg = Get-ConfigJson -Path $configPrimary
+    if (-not $cfg.auth) { $cfg | Add-Member -MemberType NoteProperty -Name auth -Value ([PSCustomObject]@{}) }
+    if (-not $cfg.auth.mode) { $cfg.auth.mode = "app" }
+
+    $changed = $false
+    if ($cfg.auth.tenantId -ne $TenantId) { $cfg.auth.tenantId = $TenantId; $changed = $true }
+    if ($cfg.auth.clientId -ne $ClientId) { $cfg.auth.clientId = $ClientId; $changed = $true }
+
+    if ($changed) {
+        Save-ConfigJson -Path $configPrimary -Object $cfg
+        Write-Info "Updated config TenantId/ClientId: $configPrimary"
+    }
+} catch {
+    Write-Warn "Failed to populate TenantId/ClientId in config: $($_.Exception.Message)"
+}
+#endregion Config (Seed + Migration + Populate Tenant/Client)
+
+#region Remove stale Current config (prevent mismatches)
 $staleCurrentConfig = Join-Path $current "customer.config.json"
-
 if (Test-Path -LiteralPath $staleCurrentConfig) {
     try {
         Remove-Item -LiteralPath $staleCurrentConfig -Force -ErrorAction Stop
@@ -219,21 +255,7 @@ if (Test-Path -LiteralPath $staleCurrentConfig) {
 }
 #endregion Remove stale Current config
 
-
-#region Ensure Certificate (app-only)
-function Get-ConfigJson {
-    param([Parameter(Mandatory)][string]$Path)
-    return (Get-Content -Raw -LiteralPath $Path) | ConvertFrom-Json
-}
-
-function Save-ConfigJson {
-    param(
-        [Parameter(Mandatory)][string]$Path,
-        [Parameter(Mandatory)]$Object
-    )
-    ($Object | ConvertTo-Json -Depth 10) | Set-Content -LiteralPath $Path -Encoding UTF8 -Force
-}
-
+#region Ensure Certificate (app-only, CSP provider to avoid CNG key ACL issues)
 function Find-CertByThumbprint {
     param([Parameter(Mandatory)][string]$Thumbprint)
     $t = ($Thumbprint -replace '\s','').ToUpper()
@@ -255,6 +277,7 @@ function New-NubrixCertLocalMachine {
         -KeySpec Signature `
         -KeyLength 2048 `
         -HashAlgorithm SHA256 `
+        -Provider "Microsoft Enhanced RSA and AES Cryptographic Provider" `
         -NotAfter (Get-Date).AddYears($YearsValid)
 }
 
@@ -272,7 +295,7 @@ if (-not $cfg.auth -or [string]::IsNullOrWhiteSpace($cfg.auth.mode)) {
 } else {
 
     $thumb = "$($cfg.auth.certThumbprint)".Trim()
-    $cert = $null
+    $cert  = $null
 
     if (-not [string]::IsNullOrWhiteSpace($thumb)) {
         $cert = Find-CertByThumbprint -Thumbprint $thumb
@@ -292,17 +315,16 @@ if (-not $cfg.auth -or [string]::IsNullOrWhiteSpace($cfg.auth.mode)) {
             exit 1
         }
 
-        # Update config thumbprint to match this machine
         if (-not $cfg.auth) { $cfg | Add-Member -MemberType NoteProperty -Name auth -Value ([PSCustomObject]@{}) }
         $cfg.auth.certThumbprint = $newCert.Thumbprint
         Save-ConfigJson -Path $configPrimary -Object $cfg
 
         Write-Info "Exported public cert to: $cerOut"
         Write-Info "Updated config thumbprint to: $($newCert.Thumbprint)"
-        Write-Warn "If this new cert is not yet uploaded to the app registration, upload: $cerOut"
+        Write-Warn "Upload this cert to the app registration if not already done: $cerOut"
     }
 }
-#endregion Ensure Certificate (app-only)
+#endregion Ensure Certificate (app-only, CSP provider)
 
 #region Shortcut + Launch
 # Use Public Desktop so shortcut appears even when running elevated
