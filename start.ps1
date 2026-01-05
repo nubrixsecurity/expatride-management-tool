@@ -206,6 +206,20 @@ if (-not (Test-Path -LiteralPath $configPrimary)) {
 }
 #endregion Config (Seed + Migration)
 
+#region Remove stale Current config (prevent thumbprint mismatches)
+$staleCurrentConfig = Join-Path $current "customer.config.json"
+
+if (Test-Path -LiteralPath $staleCurrentConfig) {
+    try {
+        Remove-Item -LiteralPath $staleCurrentConfig -Force -ErrorAction Stop
+        Write-Info "Removed stale config from Current: $staleCurrentConfig"
+    } catch {
+        Write-Warn "Could not remove stale config from Current: $($_.Exception.Message)"
+    }
+}
+#endregion Remove stale Current config
+
+
 #region Ensure Certificate (app-only)
 function Get-ConfigJson {
     param([Parameter(Mandatory)][string]$Path)
@@ -241,7 +255,6 @@ function New-NubrixCertLocalMachine {
         -KeySpec Signature `
         -KeyLength 2048 `
         -HashAlgorithm SHA256 `
-        -Provider "Microsoft Enhanced RSA and AES Cryptographic Provider" `
         -NotAfter (Get-Date).AddYears($YearsValid)
 }
 
@@ -308,4 +321,3 @@ Write-Info "Shortcut created: $shortcutPath"
 Write-Info "Launching program..."
 Start-Process -FilePath $psExe -ArgumentList "-NoProfile -ExecutionPolicy Bypass -File `"$main`""
 #endregion Shortcut + Launch
-
