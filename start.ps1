@@ -241,6 +241,7 @@ function New-NubrixCertLocalMachine {
         -KeySpec Signature `
         -KeyLength 2048 `
         -HashAlgorithm SHA256 `
+        -Provider "Microsoft Enhanced RSA and AES Cryptographic Provider" `
         -NotAfter (Get-Date).AddYears($YearsValid)
 }
 
@@ -307,3 +308,4 @@ Write-Info "Shortcut created: $shortcutPath"
 Write-Info "Launching program..."
 Start-Process -FilePath $psExe -ArgumentList "-NoProfile -ExecutionPolicy Bypass -File `"$main`""
 #endregion Shortcut + Launch
+
