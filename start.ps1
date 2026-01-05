@@ -9,8 +9,11 @@
     - Ensures config lives in ProgramData\Config (survives updates)
     - Migrates config from Current -> Config if needed
     - Populates TenantId + ClientId in config (hardcoded below)
-    - Ensures an app-only certificate exists in LocalMachine\My (CSP provider to avoid CNG key permission issues)
-    - Exports public cert for upload to app registration and updates config thumbprint if it generates one
+    - Ensures an app-only certificate exists in LocalMachine\My
+        - Reuses existing CN cert if present (prevents cert roulette on re-runs)
+        - Only generates a new cert if none exist
+        - Updates config thumbprint to match the cert actually on the machine
+        - Exports public cert for upload to app registration
     - Creates a shortcut on the Public Desktop (works even when elevated)
     - Launches Main.ps1
 
@@ -46,6 +49,10 @@ param(
 # Hardcode customer tenant + app registration values (as requested)
 [string]$TenantId = "344afb64-754e-45cb-b6c3-8d51d1946615"
 [string]$ClientId = "3769a834-0162-49d2-897f-4b5a255a3ce3"
+
+# Certificate identity for this tool
+[string]$CertSubject = "CN=Nubrix-Management-Tool"
+[int]$CertYearsValid = 2
 
 #region Helpers (no emojis/icons)
 function Write-Info { param([string]$m) Write-Host $m -ForegroundColor Cyan }
@@ -160,7 +167,6 @@ try {
     exit 1
 }
 
-# ZIP extracts to a single top-level folder in most cases
 $extractedRoot = Get-ChildItem -LiteralPath $tempExtract -Directory | Select-Object -First 1
 if (-not $extractedRoot) {
     Write-Err "Could not find extracted root folder."
@@ -193,7 +199,6 @@ Get-ChildItem -LiteralPath $current -Recurse -File -ErrorAction SilentlyContinue
 $configPrimary  = Join-Path $config  "customer.config.json"
 $configFallback = Join-Path $current "customer.config.json"
 
-# One-time migration: if config exists in Current but not in Config, copy it over
 if (-not (Test-Path -LiteralPath $configPrimary) -and (Test-Path -LiteralPath $configFallback)) {
     try {
         Copy-Item -LiteralPath $configFallback -Destination $configPrimary -Force
@@ -203,7 +208,6 @@ if (-not (Test-Path -LiteralPath $configPrimary) -and (Test-Path -LiteralPath $c
     }
 }
 
-# Seed config if still missing
 if (-not (Test-Path -LiteralPath $configPrimary)) {
 @"
 {
@@ -224,7 +228,6 @@ if (-not (Test-Path -LiteralPath $configPrimary)) {
     Write-Info "Config present: $configPrimary"
 }
 
-# Populate TenantId + ClientId (hardcoded above)
 try {
     $cfg = Get-ConfigJson -Path $configPrimary
     if (-not $cfg.auth) { $cfg | Add-Member -MemberType NoteProperty -Name auth -Value ([PSCustomObject]@{}) }
@@ -255,12 +258,29 @@ if (Test-Path -LiteralPath $staleCurrentConfig) {
 }
 #endregion Remove stale Current config
 
-#region Ensure Certificate (app-only, CSP provider to avoid CNG key ACL issues)
+#region Ensure Certificate (app-only) - reuse existing cert to prevent thumbprint churn
+function Normalize-Thumbprint {
+    param([string]$Thumbprint)
+    if ([string]::IsNullOrWhiteSpace($Thumbprint)) { return "" }
+    return (($Thumbprint -replace '\s','').ToUpper())
+}
+
 function Find-CertByThumbprint {
     param([Parameter(Mandatory)][string]$Thumbprint)
-    $t = ($Thumbprint -replace '\s','').ToUpper()
+    $t = Normalize-Thumbprint $Thumbprint
+    if ([string]::IsNullOrWhiteSpace($t)) { return $null }
+
     return Get-ChildItem Cert:\LocalMachine\My -ErrorAction SilentlyContinue |
-        Where-Object { $_.Thumbprint.ToUpper() -eq $t } |
+        Where-Object { (Normalize-Thumbprint $_.Thumbprint) -eq $t -and $_.HasPrivateKey } |
+        Select-Object -First 1
+}
+
+function Find-CertBySubjectNewest {
+    param([Parameter(Mandatory)][string]$SubjectCN)
+
+    return Get-ChildItem Cert:\LocalMachine\My -ErrorAction SilentlyContinue |
+        Where-Object { $_.Subject -eq $SubjectCN -and $_.HasPrivateKey } |
+        Sort-Object NotAfter -Descending |
         Select-Object -First 1
 }
 
@@ -294,40 +314,49 @@ if (-not $cfg.auth -or [string]::IsNullOrWhiteSpace($cfg.auth.mode)) {
     Write-Info "Auth mode is not 'app' (mode=$($cfg.auth.mode)). Skipping certificate setup."
 } else {
 
-    $thumb = "$($cfg.auth.certThumbprint)".Trim()
+    $thumb = Normalize-Thumbprint "$($cfg.auth.certThumbprint)"
     $cert  = $null
 
+    # 1) If config thumbprint points to a real cert, use it
     if (-not [string]::IsNullOrWhiteSpace($thumb)) {
         $cert = Find-CertByThumbprint -Thumbprint $thumb
     }
 
-    if ($cert) {
-        Write-Info "Certificate found in LocalMachine\My: $($cert.Thumbprint)"
-    } else {
-        Write-Warn "Certificate not found (or thumbprint missing). Generating a new certificate..."
-        $newCert = New-NubrixCertLocalMachine -Subject "CN=Nubrix-Management-Tool" -YearsValid 2
-
-        $cerOut = Join-Path $config "Nubrix-Management-Tool.cer"
-        try {
-            Export-Certificate -Cert "Cert:\LocalMachine\My\$($newCert.Thumbprint)" -FilePath $cerOut | Out-Null
-        } catch {
-            Write-Err "Failed to export public cert: $($_.Exception.Message)"
-            exit 1
+    # 2) Otherwise, reuse newest cert by subject (prevents generating a new cert on rerun)
+    if (-not $cert) {
+        $cert = Find-CertBySubjectNewest -SubjectCN $CertSubject
+        if ($cert) {
+            Write-Info "Reusing existing certificate by subject: $($cert.Thumbprint)"
         }
-
-        if (-not $cfg.auth) { $cfg | Add-Member -MemberType NoteProperty -Name auth -Value ([PSCustomObject]@{}) }
-        $cfg.auth.certThumbprint = $newCert.Thumbprint
-        Save-ConfigJson -Path $configPrimary -Object $cfg
-
-        Write-Info "Exported public cert to: $cerOut"
-        Write-Info "Updated config thumbprint to: $($newCert.Thumbprint)"
-        Write-Warn "Upload this cert to the app registration if not already done: $cerOut"
     }
+
+    # 3) If still none, generate one
+    if (-not $cert) {
+        Write-Warn "No existing certificate found. Generating a new certificate..."
+        $cert = New-NubrixCertLocalMachine -Subject $CertSubject -YearsValid $CertYearsValid
+        Write-Info "Generated new certificate: $($cert.Thumbprint)"
+    }
+
+    # Ensure config thumbprint matches the cert we will actually use
+    $cfg.auth.certThumbprint = $cert.Thumbprint
+    Save-ConfigJson -Path $configPrimary -Object $cfg
+    Write-Info "Config thumbprint set to: $($cert.Thumbprint)"
+
+    # Always export public cert (safe to overwrite). This is what must be uploaded to the app registration.
+    $cerOut = Join-Path $config "Nubrix-Management-Tool.cer"
+    try {
+        Export-Certificate -Cert "Cert:\LocalMachine\My\$($cert.Thumbprint)" -FilePath $cerOut -Force | Out-Null
+        Write-Info "Public cert exported to: $cerOut"
+    } catch {
+        Write-Err "Failed to export public cert: $($_.Exception.Message)"
+        exit 1
+    }
+
+    Write-Warn "If you still get 'key was not found', upload this cert to the app registration: $cerOut"
 }
-#endregion Ensure Certificate (app-only, CSP provider)
+#endregion Ensure Certificate (app-only) - reuse existing cert
 
 #region Shortcut + Launch
-# Use Public Desktop so shortcut appears even when running elevated
 $publicDesktop = Join-Path $env:PUBLIC "Desktop"
 $shortcutPath  = Join-Path $publicDesktop ($ShortcutName + ".lnk")
 
